@@ -15,12 +15,11 @@ The purpose of this application is to:
 
 import sys
 import time
-
-from GS4Monitor_config import mqtt_broker_address, mqtt_broker_port, mqtt_keep_alive_time
-from GS4Monitor_config import mqtt_first_reconnect_delay, mqtt_reconnect_rate, mqtt_max_reconnect_delay
-from GS4Monitor_config import JGCB_mqtt_ID
+import syslog
 
 import paho.mqtt.client as mqtt
+
+from datetime import datetime
 
 from collections import deque
 
@@ -43,19 +42,17 @@ from bacpypes.local.device import LocalDeviceObject
 
 from misty.mstplib import MSTPSimpleApplication
 
+from JGCBMonitor_config import mqtt_broker_address, mqtt_broker_port, mqtt_JGCB_topics, mqtt_keep_alive_time
+from JGCBMonitor_config import mqtt_first_reconnect_delay, mqtt_reconnect_rate, mqtt_max_reconnect_delay
+from JGCBMonitor_config import JGCB_mqtt_ID, JGCB_interval
+from JGCBMonitor_config import GS4_point_list
+
 # some debugging
 _debug = 0
 _log = ModuleLogger(globals())
 
-# polling interval (in seconds)
-interval = 5
-
-# point list, set according to your device
-point_list = [
-#    (99, 'analogValue:1', 'presentValue'),
-    (99, 'analogValue:1', 'presentValue'),
-    (99, 'analogValue:2', 'presentValue'),
-    ]
+# globals
+mqtt_connected = False
 
 #
 #  Recurring Task to Monitor GS4 Drive System
@@ -64,8 +61,8 @@ point_list = [
 
 @bacpypes_debugging
 class PrairieDog(MSTPSimpleApplication, RecurringTask):
-
-    def __init__(self, interval, *args):
+    
+    def __init__(self, interval, client, *args):
         if _debug: PrairieDog._debug("__init__ %r %r", interval, args)
         MSTPSimpleApplication.__init__(self, *args)
         # set interval of recurring task (in seconds)
@@ -74,6 +71,7 @@ class PrairieDog(MSTPSimpleApplication, RecurringTask):
         # initialize to not busy
         self.GS4_busy = False
         self.arduino1_busy = False
+        self.mqtt_client = client
         
         # install the task
         self.install_task()
@@ -91,7 +89,7 @@ class PrairieDog(MSTPSimpleApplication, RecurringTask):
         #self.arduino1_busy = True
 
         # turn the point list into a queue
-        self.point_queue = deque(point_list)
+        self.point_queue = deque(GS4_point_list)
         if _debug: PrairieDog._debug("    - deque point list %r", self.point_queue)
 
         # clear out response value list
@@ -174,11 +172,11 @@ class PrairieDog(MSTPSimpleApplication, RecurringTask):
                 value = apdu.propertyValue.cast_out(datatype)
             if _debug: PrairieDog._debug("    - value: %r", value)
 
-            # write value to stdout for debugging
-            sys.stdout.write(str(value) + '\n')
-            if hasattr(value, 'debug_contents'):
-                value.debug_contents(file=sys.stdout)
-            sys.stdout.flush()
+            # write each value to stdout as it is received for debugging
+            #sys.stdout.write(str(value) + '\n')
+            #if hasattr(value, 'debug_contents'):
+                #value.debug_contents(file=sys.stdout)
+            #sys.stdout.flush()
 
             # save the value
             self.response_values.append(value)
@@ -191,14 +189,24 @@ class PrairieDog(MSTPSimpleApplication, RecurringTask):
         deferred(self.next_GS4_request)
 
     def read_GS4_complete(self):
+        global mqtt_connected
         if _debug: PrairieDog._debug("read_GS4_complete")
 
-        # for now, dump out the results to screen
-        for request, response in zip(point_list, self.response_values):
-            print(request, response)
+        # dump out the request and results to screen for debug
+        #for request, response in zip(GS4_point_list, self.response_values):
+        #    print(request, response)
 
         # Publish results to JGCB mqtt topic
+        idx = 0
+        for topic in mqtt_JGCB_topics:
+            if mqtt_connected == True:
+                self.mqtt_client.publish(self.response_values[idx])
+                self.mqtt_client.publish(self.response_values[idx+1])
+                self.mqtt_client.publish(self.response_values[idx+2])
+                self.mqtt_client.publish(self.response_values[idx+3])
 
+            print(self.response_values[idx], self.response_values[idx+1]), print(self.response_values[idx+2], self.response_values[idx+3])
+            idx+=4
         # GS4 requests processed
         self.GS4_busy = False
 
@@ -224,63 +232,73 @@ class PrairieDog(MSTPSimpleApplication, RecurringTask):
             return False
 
 def mqtt_init(id, topic):
+    global mqtt_connected
     if _debug: _log.debug("mqtt_init")
+
+    client = None
 
     def on_mqtt_connect(client, userdata, flags, rc):
         if rc == 0:
             # success
-            if _debug: _log._debug("    - mqtt client %r connected to broker with result code %r", client, rc)
-            client.subscribe(topic)
+            if _debug: _log.debug("    - mqtt client %r connected to broker with result code %r", client, rc)
+            mqtt_connected = True
+            for topic in mqtt_JGCB_topics:
+                client.subscribe(topic)
             # syslog
         else:
-            if _debug: _log._debug("    - mqtt client failed to connect with result code %r", rc)
+            if _debug: _log.debug("    - mqtt client failed to connect with result code %r", rc)
             # syslog
 
-    def on_mqtt_disconnect(client, userdata, rc)
-        if _debug: _log._debug("    - mqtt client %r disconnected with result code %r", client, rc)
+    def on_mqtt_disconnect(client, userdata, rc):
+        if _debug: _log.debug("    - mqtt client %r disconnected with result code %r", client, rc)
+        mqtt_connected = False
         # syslog
         
         reconnect_delay = mqtt_first_reconnect_delay
         while True:
-            if _debug: _log._debug("    - try mqtt reconnect in %r seconds", reconnect_delay)
+            if _debug: _log.debug("    - try mqtt reconnect in %r seconds", reconnect_delay)
             time.sleep(reconnect_delay)
 
             try:
                 client.reconnect()
-                if _debug: _log._debug("    - mqtt client reconnected successfully")
+                if _debug: _log.debug("    - mqtt client reconnected successfully")
+                mqtt_connected = True
                 # syslog
                 return
             except Exception as err:
-                if _debug: _log._debug("    - mqtt client reconnect failed with err %r.  Retrying...", err)
+                if _debug: _log.debug("    - mqtt client reconnect failed with err %r.  Retrying...", err)
                 # syslog
                 if reconnect_delay == mqtt_max_reconnect_delay:
-                    if _debug: _log._debug("    - max mqtt retry delay reached, fallback to LoRa")
+                    if _debug: _log.debug("    - max mqtt retry delay reached, fallback to LoRa")
                     # TODO: spawn LoRa backup comm here
 
             reconnect_delay *= mqtt_reconnect_rate
             reconnect_delay = min(reconnect_delay, mqtt_max_reconnect_delay)
 
-    def on_mqtt_message(client, userdata, msg)
-        if _debug: _log._debug("mqtt client %r received unsupported message", client)
+    def on_mqtt_message(client, userdata, msg):
+        if _debug: _log.debug("mqtt client %r received unsupported message", client)
         # default message client
         # do nothing
 
-    try:
-        client = mqtt.Client(id)
-        if _debug: _log._debug("    - mqtt client created")
-    except Exception as str_error:
-        if _debug: _log._debug("    - couldn't create mqtt client")
-        #syslog?
+    while client == None:
+        try:
+            client = mqtt.Client()
+            if _debug: _log.debug("    - mqtt client created")
+            #simple security with username/pw; for better security use SSL/TLS certs
+            #client.username_pw_set(username, password)
+            client.on_connect = on_mqtt_connect
+            client.on_disconnect = on_mqtt_disconnect
+            client.on_message = on_mqtt_message
 
-    #simple security; use SSL/TLS certs for better security
-    #client.username_pw_set(username, password)
-    client.on_connect = on_mqtt_connect
-    client.on_disconnect = on_mqtt_disconnect
-    client.on_message = on_mqtt_message
+        except Exception as str_error:
+            if _debug: _log.debug("    - couldn't create mqtt client")
+            time.sleep(10)
+            #syslog?
 
     return client
 
-def on_stuff_msg_callback()
+def on_stuff_msg_callback():
+    if _debug: _log.debug("mqtt callback for message received on stuff topic")
     # do stuff if we get a do stuff message
 
 
@@ -311,29 +329,30 @@ def main():
     if hasattr(args.ini, 'mstpdbgfile'):
        mstp_args['_mstpdbgfile'] = str(args.ini.mstpdbgfile)
 
-    # set up mqtt client
-    JGCB_mqtt_client = mqtt_init(JGCB_mqtt_ID, stuff_topic)
-    JGCB_mqtt_client.connect(mqtt_broker_address, mqtt_broker_port, mqtt_keep_alive_time)
-    if _debug: _log.debug("    - JGCB mqtt client connect commang issued")
-    
-    JGCB_mqtt_client.message_callback_add(stuff_topic, on_stuff_msg_callback)
-    JGCB_mqtt_client.loop_start()
-    if _debug: _log.debug("    - JGCB mqtt client loop started")
-    
     # create local deice object
     this_device = LocalDeviceObject(ini=args.ini, **mstp_args)
     if _debug: _log.debug("    - this_device: %r", this_device)
 
+    # create mqtt client
+    JGCB_mqtt_client = mqtt_init(JGCB_mqtt_ID, mqtt_JGCB_topics)
+
     # make recurring MSTP BACnet applications
-    this_application = PrairieDog(interval, this_device, args.ini.address)
+    this_application = PrairieDog(JGCB_interval, JGCB_mqtt_client, this_device, args.ini.address)
     if _debug: _log.debug("    - this_application: %r", this_application)
 
+    #JGCB_mqtt_client.connect(mqtt_broker_address, mqtt_broker_port, mqtt_keep_alive_time)
+    #if _debug: _log.debug("    - JGCB mqtt client connect commang issued")
+    
+    #JGCB_mqtt_client.message_callback_add(mqtt_JGCB_topic, on_stuff_msg_callback)
+    #JGCB_mqtt_client.loop_start()
+    #if _debug: _log.debug("    - JGCB mqtt client loop started")
+    
     _log.debug("running")
 
     run()
     
     # clean up
-    JGCB_mqtt_client.loop_stop()
+    #JGCB_mqtt_client.loop_stop()
     
     _log.debug("fini")
 
