@@ -21,10 +21,10 @@ JGCB_mqtt_ID = 12
 # ***NOTE: POINT_LIST MUST MATCH MQTT TOPIC LIST
 GS4_point_list = [
     #FreqRef
-    (99, 'analogValue:01', 'objectName'),
-    (99, 'analogValue:01', 'presentValue'),
-    (99, 'analogValue:01', 'units'),
-    (99, 'analogValue:01', 'statusFlags'),
+    (99, 'analogValue:31', 'objectName'),
+    (99, 'analogValue:31', 'presentValue'),
+    (99, 'analogValue:31', 'units'),
+    (99, 'analogValue:31', 'statusFlags'),
     #SetPointPct
     (99, 'analogValue:11', 'objectName'),
     (99, 'analogValue:11', 'presentValue'),
